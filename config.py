@@ -1,5 +1,5 @@
 from os import getenv
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file (create one from sample.env)
@@ -76,6 +76,19 @@ class Config:
         # Maximum video height (in pixels) when downloading /vplay media
         self.VIDEO_MAX_HEIGHT: int = self._parse_video_height()
 
+        # ============ YOUTUBE API CONFIGURATION (NEW) ============
+        # YouTube download API URL (Railway/self-hosted)
+        self.YOUTUBE_API_URL: str = getenv("YOUTUBE_API_URL", "")
+        
+        # Enable/disable API fallback when cookies fail
+        self.ENABLE_API_FALLBACK: bool = self._str_to_bool(getenv("ENABLE_API_FALLBACK", "True"))
+        
+        # API timeout in seconds for downloads
+        self.API_TIMEOUT: int = int(getenv("API_TIMEOUT", "60"))
+        
+        # API timeout for stream downloads (longer for large files)
+        self.API_STREAM_TIMEOUT: int = int(getenv("API_STREAM_TIMEOUT", "300"))
+
         # ============ YOUTUBE COOKIES ============
         # Parse space-separated cookie URLs for age-restricted content
         self.COOKIES_URL: List[str] = self._parse_cookies()
@@ -84,21 +97,21 @@ class Config:
         # URLs for various bot images
         self.DEFAULT_THUMB: str = getenv(
             "DEFAULT_THUMB",
-            "https://files.catbox.moe/f177uk.jpg"  # Default thumbnail
+            "https://files.catbox.moe/al5k9d.png"  
         )
         self.PING_IMG: str = getenv(
-            "PING_IMG", "https://files.catbox.moe/f177uk.jpg")    # Ping command image
+            "PING_IMG", "https://files.catbox.moe/al5k9d.png")    
         self.START_IMG: str = getenv(
-            "START_IMG", "https://files.catbox.moe/f177uk.jpg")  # Start command image
+            "START_IMG", "https://files.catbox.moe/al5k9d.png")  
         self.RADIO_IMG: str = getenv(
-            "RADIO_IMG", "https://files.catbox.moe/f177uk.jpg")    # Radio command image
+            "RADIO_IMG", "https://files.catbox.moe/al5k9d.png")    
 
         # ============ MODERATION ============
         # List of usernames to exclude from admin mentions
         self.EXCLUDED_USERNAMES: List[str] = getenv("EXCLUDED_USERNAMES", "").split()
 
     def _parse_video_height(self) -> int:
-        """Clamp configured video height to a safe HD range."""
+        """Parse and validate video height configuration."""
         default_height = 1080
         raw_value = getenv("VIDEO_MAX_HEIGHT", str(default_height))
         try:
@@ -106,11 +119,9 @@ class Config:
         except (TypeError, ValueError):
             return default_height
 
-        # Allow disabling the cap by setting to 0 or negative (interpreted as unlimited)
         if height <= 0:
             return 0
 
-        # Clamp between 480p and 2160p to avoid unrealistic requests
         return max(480, min(height, 2160))
 
     def _parse_excluded_chats(self) -> List[int]:
@@ -190,3 +201,7 @@ class Config:
                 f"❌ Missing required environment variables: {', '.join(missing)}\n"
                 f"Please check your .env file and ensure all required variables are set."
             )
+
+
+# Global config instance
+config = Config()
