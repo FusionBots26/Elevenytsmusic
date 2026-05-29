@@ -8,6 +8,7 @@ import yt_dlp
 import random
 import asyncio
 import aiohttp
+import aiofiles
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Union
@@ -16,6 +17,14 @@ from pyrogram import enums, types
 from py_yt import Playlist, VideosSearch
 from Elevenyts import config, logger
 from Elevenyts.helpers import Track, utils
+
+
+# ── Shruti API config ─────────────────────────────────────────────────────────
+SHRUTI_API_URL        = os.environ.get("SHRUTI_API_URL", "https://api.shrutibots.site")
+SHRUTI_API_KEY        = os.environ.get("SHRUTI_API_KEY", "ShrutiBotsZWU3vIU63uUHoUPgOw2m")  # Get from @SHRUTIAPIBOT on Telegram
+DOWNLOAD_DIR          = "downloads"
+SHRUTI_TOKEN_TIMEOUT  = 10    # seconds — fetch download token
+SHRUTI_STREAM_TIMEOUT = 900   # 15 min  — stream long songs
 
 
 class YouTube:
@@ -31,6 +40,11 @@ class YouTube:
         self.enable_api_fallback = config.ENABLE_API_FALLBACK
         self.api_timeout = config.API_TIMEOUT
         self.api_stream_timeout = config.API_STREAM_TIMEOUT
+
+        # Shruti API config (override from env if set)
+        self.shruti_api_url = SHRUTI_API_URL
+        self.shruti_api_key = SHRUTI_API_KEY
+        self.shruti_stream_timeout = SHRUTI_STREAM_TIMEOUT
 
         # Regular expression to match YouTube URLs
         self.regex = re.compile(
@@ -49,6 +63,19 @@ class YouTube:
             logger.info(f"🔄 YouTube API fallback enabled: {self.api_url}")
         else:
             logger.info("⚠️ YouTube API fallback disabled")
+
+        logger.info(f"🎵 Shruti API configured: {self.shruti_api_url}")
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_video_id(url: str) -> str:
+        """Extract raw video ID from any YouTube URL format."""
+        if "v=" in url:
+            return url.split("v=")[-1].split("&")[0]
+        if "youtu.be/" in url:
+            return url.split("youtu.be/")[-1].split("?")[0]
+        return url
 
     def _locate_download_file(self, video_id: str, video: bool = False) -> Optional[str]:
         """Locate any completed download file for a video id."""
@@ -80,6 +107,8 @@ class YouTube:
             return path
         return None
 
+    # ── Cookie helpers ────────────────────────────────────────────────────────
+
     def get_cookies(self):
         """Get random cookie file from cookies directory."""
         if not self.checked:
@@ -89,13 +118,13 @@ class YouTube:
                     if file.endswith(".txt"):
                         self.cookies.append(file)
             self.checked = True
-        
+
         if not self.cookies:
             if not self.warned:
                 self.warned = True
                 logger.warning("🍪 Cookies are missing; downloads might fail.")
             return None
-        
+
         cookie_file = f"Elevenyts/cookies/{random.choice(self.cookies)}"
         logger.debug(f"Using cookie file: {cookie_file}")
         return cookie_file
@@ -104,16 +133,16 @@ class YouTube:
         """Save cookies from URLs to files."""
         logger.info("🍪 Saving cookies from urls...")
         saved_count = 0
-        
+
         # Create cookies directory if not exists
         cookies_dir = Path("Elevenyts/cookies")
         cookies_dir.mkdir(parents=True, exist_ok=True)
-        
+
         for url in urls:
             try:
                 # Generate unique filename
                 path = cookies_dir / f"cookie{random.randint(10000, 99999)}.txt"
-                
+
                 # Convert to raw URL if needed
                 if "pastebin.com" in url:
                     link = url.replace("pastebin.com", "pastebin.com/raw")
@@ -121,63 +150,117 @@ class YouTube:
                     link = url.replace("batbin.me", "batbin.me/raw")
                 else:
                     link = url
-                
+
                 async with aiohttp.ClientSession() as session:
                     async with session.get(link, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                         if resp.status != 200:
                             logger.error(f"❌ Cookie download failed: HTTP {resp.status} from {url}")
                             continue
-                        
+
                         content = await resp.read()
                         if not content or len(content) < 50:
                             logger.error(f"❌ Cookie file empty or invalid from {url}")
                             continue
-                        
+
                         # Save cookie file
                         with open(path, "wb") as fw:
                             fw.write(content)
-                        
+
                         if path.exists() and path.stat().st_size > 0:
                             saved_count += 1
                             cookie_filename = path.name
                             if cookie_filename not in self.cookies:
                                 self.cookies.append(cookie_filename)
                             logger.info(f"✅ Saved: {cookie_filename} ({len(content)} bytes)")
-                            
+
             except asyncio.TimeoutError:
                 logger.error(f"❌ Cookie download timeout from {url}")
             except Exception as e:
                 logger.error(f"❌ Cookie download error from {url}: {e}")
-        
+
         self.checked = True
-        
+
         if saved_count > 0:
             logger.info(f"✅ Cookies saved successfully! ({saved_count} file(s))")
         else:
             logger.error("❌ No cookies saved! Check COOKIE_URL in .env. YouTube downloads will fail!")
 
-    async def download_via_api(self, link: str, video: bool = False) -> Optional[str]:
-        """Download audio/video using Railway API (fallback when cookies fail)."""
-        if not self.enable_api_fallback:
-            logger.debug("API fallback is disabled in config")
-            return None
+    # ── Shruti API download ───────────────────────────────────────────────────
 
-        # Extract video ID from URL
-        if "v=" in link:
-            video_id = link.split("v=")[-1].split("&")[0]
-        elif "youtu.be" in link:
-            video_id = link.split("/")[-1].split("?")[0]
-        else:
-            video_id = link
-
+    async def download_via_shruti(self, link: str, video: bool = False) -> Optional[str]:
+        """Download audio/video using Shruti API."""
+        video_id = self._extract_video_id(link)
         if not video_id or len(video_id) < 3:
             return None
 
-        DOWNLOAD_DIR = "downloads"
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        
+        file_ext  = ".mp4" if video else ".mp3"
+        file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}{file_ext}")
+
+        # Disk cache
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            logger.debug(f"Shruti disk cache hit: {file_path}")
+            return file_path
+
+        dl_type = "video" if video else "audio"
+
+        try:
+            logger.info(f"🎵 Trying Shruti API for {video_id} (type: {dl_type})")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.shruti_api_url}/download",
+                    params={
+                        "url":     video_id,
+                        "type":    dl_type,
+                        "api_key": self.shruti_api_key,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=self.shruti_stream_timeout),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"[shruti] HTTP {resp.status} for {video_id}")
+                        return None
+
+                    async with aiofiles.open(file_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(131072):
+                            await f.write(chunk)
+
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                logger.info(f"✅ Shruti download done: {file_path}")
+                return file_path
+
+            return None
+
+        except asyncio.TimeoutError:
+            logger.debug(f"Shruti API timeout for {video_id}")
+            return None
+        except Exception as e:
+            logger.debug(f"Shruti API download failed for {video_id}: {e}")
+            return None
+
+    # ── Railway API download (original fallback) ──────────────────────────────
+
+    async def download_via_api(self, link: str, video: bool = False) -> Optional[str]:
+        """Download audio/video using Shruti API first, then Railway API as fallback."""
+
+        # ── Try Shruti API first ──────────────────────────────────────────────
+        shruti_result = await self.download_via_shruti(link, video=video)
+        if shruti_result:
+            return shruti_result
+
+        # ── Railway API fallback ──────────────────────────────────────────────
+        if not self.enable_api_fallback:
+            logger.debug("Railway API fallback is disabled in config")
+            return None
+
+        # Extract video ID from URL
+        video_id = self._extract_video_id(link)
+        if not video_id or len(video_id) < 3:
+            return None
+
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
         # Set file extension based on type
-        file_ext = ".mp4" if video else ".mp3"
+        file_ext  = ".mp4" if video else ".mp3"
         file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}{file_ext}")
 
         # Check if already downloaded
@@ -187,45 +270,48 @@ class YouTube:
 
         # Choose endpoint based on type
         endpoint = "/vdown" if video else "/download"
-        
+
         try:
-            logger.info(f"🔄 Trying API fallback for {video_id} (endpoint: {endpoint})")
-            
+            logger.info(f"🔄 Trying Railway API fallback for {video_id} (endpoint: {endpoint})")
+
             async with aiohttp.ClientSession() as session:
                 params = {"url": f"https://youtu.be/{video_id}"}
-                
+
                 async with session.get(
                     f"{self.api_url}{endpoint}",
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=self.api_timeout),
                 ) as response:
                     if response.status != 200:
-                        logger.debug(f"API returned status {response.status}")
+                        logger.debug(f"Railway API returned status {response.status}")
                         return None
-                    
+
                     # Check content type
                     content_type = response.headers.get('content-type', '')
-                    
+
                     if 'application/json' in content_type:
                         # Parse JSON response
                         data = await response.json()
                         stream_url = data.get('stream_url') or data.get('url')
-                        
+
                         if not stream_url:
                             logger.debug("No stream URL in API response")
                             return None
-                        
+
                         # Download from stream URL
                         logger.info(f"📥 Downloading from stream URL: {stream_url[:50]}...")
-                        async with session.get(stream_url, timeout=aiohttp.ClientTimeout(total=self.api_stream_timeout)) as file_response:
+                        async with session.get(
+                            stream_url,
+                            timeout=aiohttp.ClientTimeout(total=self.api_stream_timeout)
+                        ) as file_response:
                             if file_response.status != 200:
                                 return None
-                            
+
                             with open(file_path, "wb") as f:
                                 async for chunk in file_response.content.iter_chunked(16384):
                                     f.write(chunk)
-                            
-                            logger.info(f"✅ API download successful: {file_path}")
+
+                            logger.info(f"✅ Railway API download successful: {file_path}")
                             return file_path
                     else:
                         # Direct binary download
@@ -233,16 +319,18 @@ class YouTube:
                         with open(file_path, "wb") as f:
                             async for chunk in response.content.iter_chunked(16384):
                                 f.write(chunk)
-                        
-                        logger.info(f"✅ API download successful: {file_path}")
+
+                        logger.info(f"✅ Railway API download successful: {file_path}")
                         return file_path
 
         except asyncio.TimeoutError:
-            logger.debug(f"API timeout for {video_id}")
+            logger.debug(f"Railway API timeout for {video_id}")
             return None
         except Exception as e:
-            logger.debug(f"API download failed for {video_id}: {e}")
+            logger.debug(f"Railway API download failed for {video_id}: {e}")
             return None
+
+    # ── URL helpers ───────────────────────────────────────────────────────────
 
     def valid(self, url: str) -> bool:
         """Check if URL is a valid YouTube URL."""
@@ -252,7 +340,7 @@ class YouTube:
         """Extract YouTube URL from message."""
         messages = [message_1]
         link = None
-        
+
         if message_1.reply_to_message:
             messages.append(message_1.reply_to_message)
 
@@ -276,9 +364,11 @@ class YouTube:
             return link.split("&si")[0].split("?si")[0]
         return None
 
+    # ── Search ────────────────────────────────────────────────────────────────
+
     async def search(self, query: str, m_id: int) -> Track | None:
         """Search for a song on YouTube."""
-        cache_key = query
+        cache_key    = query
         current_time = asyncio.get_running_loop().time()
 
         # Check cache
@@ -287,10 +377,10 @@ class YouTube:
             if current_time - cache_timestamp < 600:  # 10 minutes TTL
                 fresh = replace(cached_result)
                 fresh.message_id = m_id
-                fresh.file_path = None
-                fresh.user = None
-                fresh.time = 0
-                fresh.video = False
+                fresh.file_path  = None
+                fresh.user       = None
+                fresh.time       = 0
+                fresh.video      = False
                 return fresh
 
         try:
@@ -301,9 +391,9 @@ class YouTube:
             return None
 
         if results and results["result"]:
-            data = results["result"][0]
+            data     = results["result"][0]
             duration = data.get("duration")
-            is_live = duration is None or duration == "LIVE"
+            is_live  = duration is None or duration == "LIVE"
 
             track = Track(
                 id=data.get("id"),
@@ -320,7 +410,7 @@ class YouTube:
 
             # Cache result
             self.search_cache[cache_key] = (track, current_time)
-            
+
             # Clean old cache entries
             if len(self.search_cache) > 100:
                 oldest_key = min(self.search_cache.keys(),
@@ -330,10 +420,12 @@ class YouTube:
             return replace(track)
         return None
 
+    # ── Playlist ──────────────────────────────────────────────────────────────
+
     async def playlist(self, limit: int, user: str, url: str) -> list[Track]:
         """Extract tracks from a YouTube playlist."""
         try:
-            plist = await Playlist.get(url)
+            plist  = await Playlist.get(url)
             tracks = []
 
             if not plist or "videos" not in plist or not plist["videos"]:
@@ -341,7 +433,7 @@ class YouTube:
 
             for data in plist["videos"][:limit]:
                 try:
-                    thumbnails = data.get("thumbnails", [])
+                    thumbnails    = data.get("thumbnails", [])
                     thumbnail_url = ""
                     if thumbnails and len(thumbnails) > 0:
                         thumbnail_url = thumbnails[-1].get("url", "").split("?")[0]
@@ -367,11 +459,13 @@ class YouTube:
                     continue
 
             return tracks
-        except KeyError as e:
-            raise Exception(f"Failed to parse playlist. YouTube may have changed their structure.")
+        except KeyError:
+            raise Exception("Failed to parse playlist. YouTube may have changed their structure.")
         except Exception as e:
             logger.error(f"Playlist extraction error: {e}")
             raise
+
+    # ── Main download ─────────────────────────────────────────────────────────
 
     async def download(self, video_id: str, is_live: bool = False, video: bool = False) -> Optional[str]:
         """Download audio/video from YouTube."""
@@ -379,7 +473,7 @@ class YouTube:
 
         # For live streams, extract the direct stream URL
         if is_live:
-            cookie = self.get_cookies()
+            cookie   = self.get_cookies()
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
@@ -423,13 +517,13 @@ class YouTube:
 
         # Download audio/video file
         filename_pattern = f"downloads/{video_id}"
-        
+
         # Check existing files
         existing_files = [
             f for f in glob.glob(f"{filename_pattern}.*")
             if not f.endswith('.part')
         ]
-        
+
         if video:
             video_candidates = [
                 f for f in existing_files
@@ -454,7 +548,7 @@ class YouTube:
             if container_fallbacks:
                 logger.debug(f"Found existing container file: {container_fallbacks[0]}")
                 return container_fallbacks[0]
-        
+
         # Create downloads directory
         downloads_dir = Path("downloads")
         if not downloads_dir.exists():
@@ -466,7 +560,7 @@ class YouTube:
                 return None
 
         async with self._download_semaphore:
-            cookie = self.get_cookies()
+            cookie    = self.get_cookies()
             base_opts = {
                 "outtmpl": "downloads/%(id)s.%(ext)s",
                 "quiet": True,
@@ -527,13 +621,13 @@ class YouTube:
                     if not info:
                         logger.error(f"❌ Failed to extract info for {video_id}")
                         return None
-                    
+
                     time.sleep(0.5)
                     located = self._locate_download_file(video_id, video=video)
                     if located:
                         logger.info(f"✅ Download completed: {located}")
                         return located
-                    
+
                     logger.error(f"❌ Download completed but file not found for: {video_id}")
                     return None
                 except Exception as ex:
@@ -553,17 +647,23 @@ class YouTube:
             # Try downloading with cookies first
             logger.info(f"📥 Downloading {video_id} with cookies...")
             result = await asyncio.to_thread(_download, ydl_opts_cookie)
-            
-            # If cookie download failed, try API as fallback
-            if not result and self.enable_api_fallback:
-                logger.info(f"🔄 Cookie download failed for {video_id}, trying API fallback...")
-                result = await self.download_via_api(url, video=video)
-                
+
+            # If cookie download failed, try Shruti API then Railway API as fallback
+            if not result:
+                logger.info(f"🔄 Cookie download failed for {video_id}, trying Shruti API...")
+                result = await self.download_via_shruti(url, video=video)
+
                 if result:
-                    logger.info(f"✅ API fallback successful for {video_id}")
+                    logger.info(f"✅ Shruti API successful for {video_id}")
+                elif self.enable_api_fallback:
+                    logger.info(f"🔄 Shruti failed, trying Railway API for {video_id}...")
+                    result = await self.download_via_api(url, video=video)
+
+                    if result:
+                        logger.info(f"✅ Railway API fallback successful for {video_id}")
+                    else:
+                        logger.warning(f"⚠️ All download methods failed for {video_id}")
                 else:
-                    logger.warning(f"⚠️ Both cookie and API download failed for {video_id}")
-            elif not result:
-                logger.warning(f"⚠️ Download failed for {video_id} (API fallback disabled)")
-            
+                    logger.warning(f"⚠️ Shruti failed and Railway API fallback disabled for {video_id}")
+
             return result
